@@ -1,0 +1,13 @@
+name: ecma335
+version: 0.1.0
+
+authors:
+  - Matthew J. Black <mjblack@gmail.com>
+
+crystal: '>= 1.19.1'
+
+targets:
+  ecma335-tool:
+    main: src/ecma335_tool.cr
+
+license: MIT
