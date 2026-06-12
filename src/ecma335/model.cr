@@ -669,9 +669,18 @@ module Ecma335
     getter name : String
     getter signature : String?
     getter constant_value : String?
+    getter flags : UInt16
+    getter custom_attributes : Array(String)
     getter token : UInt32?
 
-    def initialize(@name : String, @signature : String? = nil, @constant_value : String? = nil, @token : UInt32? = nil)
+    def initialize(
+      @name : String,
+      @signature : String? = nil,
+      @constant_value : String? = nil,
+      @flags : UInt16 = 0_u16,
+      @custom_attributes : Array(String) = [] of String,
+      @token : UInt32? = nil,
+    )
     end
   end
 
@@ -680,9 +689,19 @@ module Ecma335
     getter sequence : UInt16
     getter signature_type : String?
     getter constant_value : String?
+    getter flags : UInt16
+    getter custom_attributes : Array(String)
     getter token : UInt32?
 
-    def initialize(@name : String, @sequence : UInt16, @signature_type : String? = nil, @constant_value : String? = nil, @token : UInt32? = nil)
+    def initialize(
+      @name : String,
+      @sequence : UInt16,
+      @signature_type : String? = nil,
+      @constant_value : String? = nil,
+      @flags : UInt16 = 0_u16,
+      @custom_attributes : Array(String) = [] of String,
+      @token : UInt32? = nil,
+    )
     end
   end
 
@@ -693,6 +712,10 @@ module Ecma335
     getter native_import : String?
     getter native_module : String?
     getter generic_params : Array(String)
+    getter rva : UInt32
+    getter impl_flags : UInt16
+    getter flags : UInt16
+    getter custom_attributes : Array(String)
     getter token : UInt32?
 
     def initialize(
@@ -702,12 +725,18 @@ module Ecma335
       @native_import : String? = nil,
       @native_module : String? = nil,
       @generic_params : Array(String) = [] of String,
+      @rva : UInt32 = 0_u32,
+      @impl_flags : UInt16 = 0_u16,
+      @flags : UInt16 = 0_u16,
+      @custom_attributes : Array(String) = [] of String,
       @token : UInt32? = nil,
     )
     end
   end
 
   struct ApiType
+    TYPE_ATTRIBUTE_INTERFACE = 0x20_u32
+
     getter full_name : String
     getter namespace_name : String
     getter name : String
@@ -718,6 +747,11 @@ module Ecma335
     getter nested_types : Array(String)
     getter enclosing_type : String?
     getter generic_params : Array(String)
+    getter flags : UInt32
+    getter extends : UInt32
+    getter base_type : String?
+    getter class_size : UInt32?
+    getter packing_size : UInt16?
     getter token : UInt32?
 
     def initialize(
@@ -731,8 +765,17 @@ module Ecma335
       @nested_types : Array(String) = [] of String,
       @enclosing_type : String? = nil,
       @generic_params : Array(String) = [] of String,
+      @flags : UInt32 = 0_u32,
+      @extends : UInt32 = 0_u32,
+      @base_type : String? = nil,
+      @class_size : UInt32? = nil,
+      @packing_size : UInt16? = nil,
       @token : UInt32? = nil,
     )
+    end
+
+    def interface? : Bool
+      (@flags & TYPE_ATTRIBUTE_INTERFACE) != 0_u32
     end
   end
 
