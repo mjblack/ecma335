@@ -9,7 +9,7 @@ require "./ecma335/signature_canonicalizer"
 require "./ecma335/parser"
 
 module Ecma335
-  VERSION = "0.1.0"
+  VERSION = "1.1.0"
 
   def self.parse(path : String, strict : Bool = false) : ParsedAssembly
     parse_bytes(File.read(path).to_slice, strict: strict)

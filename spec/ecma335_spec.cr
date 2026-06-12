@@ -138,18 +138,28 @@ describe Ecma335 do
     sample_type.nested_types.should contain("<Module>")
     sample_type.token.should eq(0x02000001_u32)
     sample_type.generic_params.should eq([] of String)
+    sample_type.flags.should eq(0_u32)
+    sample_type.interface?.should be_false
+    sample_type.base_type.should eq("System.Object")
 
     module_type = api.type?("<Module>")
     module_type.should_not be_nil
     next unless module_type
     module_type.enclosing_type.should eq("SampleType")
     module_type.token.should eq(0x02000002_u32)
+    module_type.flags.should eq(0_u32)
+    module_type.interface?.should be_false
+    module_type.base_type.should be_nil
 
     sample_method = sample_type.methods.find { |method| method.name == "SampleMethod" }
     sample_method.should_not be_nil
     next unless sample_method
     sample_method.token.should eq(0x06000001_u32)
     sample_method.generic_params.should eq([] of String)
+    sample_method.rva.should eq(0x1234_u32)
+    sample_method.impl_flags.should eq(0_u16)
+    sample_method.flags.should eq(0_u16)
+    sample_method.custom_attributes.should eq([] of String)
     sample_method.signature.should_not be_nil
     next unless sample_method.signature
     sample_method.signature.not_nil!.return_type.should eq("void")
@@ -158,6 +168,8 @@ describe Ecma335 do
     sample_field.should_not be_nil
     next unless sample_field
     sample_field.token.should eq(0x04000001_u32)
+    sample_field.flags.should eq(0_u16)
+    sample_field.custom_attributes.should eq([] of String)
   end
 
   it "raises parse errors for non-PE input" do
