@@ -1,6 +1,28 @@
 module Ecma335
+  # Rewrites signature-decoder type strings into a compact C#-like notation:
+  #
+  #   valuetype(Foo)            -> Foo
+  #   ptr(int32)                -> int32*
+  #   byref(Foo)                -> ref Foo
+  #   szarray(uint8)            -> uint8[]
+  #   array(Foo)[rank=2]        -> Foo[,]
+  #   array(Foo)[32]            -> Foo[32]      (fixed-size, from WinMD)
+  #   nativeint / nativeuint    -> nint / nuint
+  #   object                    -> System.Object
   class SignatureCanonicalizer
     def canonicalize(type_name : String) : String
+      value = type_name
+      # Each pass only rewrites innermost forms (no nested parentheses), so
+      # repeat until nothing changes to handle e.g. ptr(array(uint8)[4]).
+      loop do
+        next_value = canonicalize_pass(value)
+        break if next_value == value
+        value = next_value
+      end
+      value
+    end
+
+    private def canonicalize_pass(type_name : String) : String
       value = type_name
       value = unwrap_named(value, "valuetype")
       value = unwrap_named(value, "class")
@@ -12,7 +34,7 @@ module Ecma335
       value = value.gsub(/typedbyref/, "typedref")
       value = value.gsub(/nativeint/, "nint")
       value = value.gsub(/nativeuint/, "nuint")
-      value = value.gsub(/object/, "System.Object")
+      value = value.gsub(/\bobject\b/, "System.Object")
       value
     end
 
@@ -24,12 +46,7 @@ module Ecma335
       pattern = /#{Regex.escape(tag)}\(([^()]*)\)/
       current = value
       while match = pattern.match(current)
-        start = match.begin(0)
-        finish = match.end(0)
-        replacement = yield(match[1])
-        prefix = start > 0 ? current[0, start] : ""
-        suffix = finish < current.bytesize ? current[finish, current.bytesize - finish] : ""
-        current = "#{prefix}#{replacement}#{suffix}"
+        current = splice(current, match.begin(0), match.end(0), yield(match[1]))
       end
       current
     end
@@ -41,17 +58,21 @@ module Ecma335
         while match = /array\(([^()]*)\)\[rank=(\d+)\]/.match(next_value)
           rank = match[2].to_i
           commas = rank > 1 ? "," * (rank - 1) : ""
-          replacement = "#{match[1]}[#{commas}]"
-          start = match.begin(0)
-          finish = match.end(0)
-          prefix = start > 0 ? next_value[0, start] : ""
-          suffix = finish < next_value.bytesize ? next_value[finish, next_value.bytesize - finish] : ""
-          next_value = "#{prefix}#{replacement}#{suffix}"
+          next_value = splice(next_value, match.begin(0), match.end(0), "#{match[1]}[#{commas}]")
+        end
+        while match = /array\(([^()]*)\)\[(\d+(?:,\d+)*)\]/.match(next_value)
+          next_value = splice(next_value, match.begin(0), match.end(0), "#{match[1]}[#{match[2]}]")
         end
         break if next_value == current
         current = next_value
       end
       current
+    end
+
+    private def splice(value : String, start : Int32, finish : Int32, replacement : String) : String
+      prefix = start > 0 ? value[0, start] : ""
+      suffix = finish < value.size ? value[finish, value.size - finish] : ""
+      "#{prefix}#{replacement}#{suffix}"
     end
   end
 end

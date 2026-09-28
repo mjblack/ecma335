@@ -159,7 +159,7 @@ describe Ecma335 do
     sample_method.rva.should eq(0x1234_u32)
     sample_method.impl_flags.should eq(0_u16)
     sample_method.flags.should eq(0_u16)
-    sample_method.custom_attributes.should eq([] of String)
+    sample_method.custom_attributes.should be_empty
     sample_method.signature.should_not be_nil
     next unless sample_method.signature
     sample_method.signature.not_nil!.return_type.should eq("void")
@@ -169,7 +169,7 @@ describe Ecma335 do
     next unless sample_field
     sample_field.token.should eq(0x04000001_u32)
     sample_field.flags.should eq(0_u16)
-    sample_field.custom_attributes.should eq([] of String)
+    sample_field.custom_attributes.should be_empty
   end
 
   it "raises parse errors for non-PE input" do
@@ -308,6 +308,117 @@ describe Ecma335 do
     api.types.size.should be > 0
     api.types.any? { |type| type.full_name.starts_with?("Windows.") || type.full_name.starts_with?("Win32.") }.should be_true
     api.find_methods("CreateFileW").size.should be >= 0
+  end
+
+  it "decodes structured custom attribute arguments" do
+    decoder = Ecma335::CustomAttributeDecoder.new
+
+    # NativeBitfieldAttribute(string name, long offset, long length)
+    bitfield_blob = Bytes[
+      0x01_u8, 0x00_u8,                                       # prolog
+      0x05_u8, 0x44_u8, 0x65_u8, 0x70_u8, 0x74_u8, 0x68_u8,   # "Depth"
+      0x00_u8, 0x00_u8, 0x00_u8, 0x00_u8, 0x00_u8, 0x00_u8, 0x00_u8, 0x00_u8, # 0_i64
+      0x10_u8, 0x00_u8, 0x00_u8, 0x00_u8, 0x00_u8, 0x00_u8, 0x00_u8, 0x00_u8, # 16_i64
+      0x00_u8, 0x00_u8,                                       # named args
+    ]
+    fixed, named = decoder.decode_args(bitfield_blob, ["string", "int64", "int64"]).not_nil!
+    fixed.should eq(["Depth", "0", "16"])
+    named.should be_empty
+
+    # MemorySizeAttribute() { BytesParamIndex = 3 } (a short property)
+    memory_size_blob = Bytes[
+      0x01_u8, 0x00_u8, # prolog
+      0x01_u8, 0x00_u8, # one named argument
+      0x54_u8,          # PROPERTY
+      0x06_u8,          # ELEMENT_TYPE_I2
+      0x0F_u8,          # name length
+      0x42_u8, 0x79_u8, 0x74_u8, 0x65_u8, 0x73_u8, 0x50_u8, 0x61_u8, 0x72_u8,
+      0x61_u8, 0x6D_u8, 0x49_u8, 0x6E_u8, 0x64_u8, 0x65_u8, 0x78_u8, # "BytesParamIndex"
+      0x03_u8, 0x00_u8, # 3_i16
+    ]
+    fixed, named = decoder.decode_args(memory_size_blob, [] of String).not_nil!
+    fixed.should be_empty
+    named.should eq({"BytesParamIndex" => "3"})
+
+    # A signature the blob cannot satisfy yields nil rather than garbage.
+    decoder.decode_args(memory_size_blob, ["int64"]).should be_nil
+  end
+
+  it "canonicalizes fixed-size and multi-dimensional arrays" do
+    canon = Ecma335::SignatureCanonicalizer.new
+    canon.canonicalize("array(valuetype(Windows.Win32.Foundation.CHAR))[32]").should eq("Windows.Win32.Foundation.CHAR[32]")
+    canon.canonicalize("ptr(array(uint8)[4,4])").should eq("uint8[4,4]*")
+    canon.canonicalize("array(int32)[rank=2]").should eq("int32[,]")
+    canon.canonicalize("szarray(nativeuint)").should eq("nuint[]")
+  end
+
+  it "exposes type kinds, layout, attributes and constants for the local winmd fixture" do
+    winmd_path = File.expand_path("../winmd/Windows.Win32.winmd", __DIR__)
+    unless File.exists?(winmd_path)
+      pending("Place Windows.Win32.winmd in ./winmd to run this integration spec")
+    end
+
+    api = Ecma335.parse(winmd_path).api_model.not_nil!
+
+    apis = api.type?("Windows.Win32.System.Threading.Apis").not_nil!
+    apis.static_class?.should be_true
+
+    create_thread = apis.methods.find { |m| m.name == "CreateThread" }.not_nil!
+    create_thread.native_import.should eq("CreateThread")
+    create_thread.native_module.should eq("KERNEL32.dll")
+    create_thread.set_last_error?.should be_true
+    create_thread.params.map(&.name).should eq(["lpThreadAttributes", "dwStackSize", "lpStartAddress", "lpParameter", "dwCreationFlags", "lpThreadId"])
+    create_thread.params.last.out?.should be_true
+    create_thread.params.last.optional?.should be_true
+    create_thread.params.first.in?.should be_true
+
+    infinite = apis.fields.find { |f| f.name == "INFINITE" }.not_nil!
+    infinite.literal?.should be_true
+    infinite.constant_type.should eq("uint32")
+    infinite.constant_value.should eq("4294967295")
+
+    flags_enum = api.type?("Windows.Win32.System.Threading.THREAD_CREATION_FLAGS").not_nil!
+    flags_enum.enum?.should be_true
+    flags_enum.has_attribute?("Flags").should be_true
+
+    delegate = api.type?("Windows.Win32.System.Threading.LPTHREAD_START_ROUTINE").not_nil!
+    delegate.delegate?.should be_true
+    delegate.methods.find { |m| m.name == "Invoke" }.not_nil!.params.size.should eq(1)
+
+    iunknown = api.type?("Windows.Win32.System.Com.IUnknown").not_nil!
+    iunknown.interface?.should be_true
+    iunknown.attribute?("Guid").not_nil!.value.should eq("00000000-0000-0000-c000-000000000046")
+    iunknown.methods.map(&.name).should eq(["QueryInterface", "AddRef", "Release"])
+
+    bstr = api.type?("Windows.Win32.Foundation.BSTR").not_nil!
+    bstr.has_attribute?("NativeTypedef").should be_true
+    bstr.attribute?("RAIIFree").not_nil!.fixed_args.should eq(["SysFreeString"])
+    bstr.fields.first.signature.should eq("ptr(char)")
+
+    handle = api.type?("Windows.Win32.Foundation.HANDLE").not_nil!
+    handle.attribute?("InvalidHandleValue").not_nil!.fixed_args.should eq(["-1"])
+
+    slist = api.type?("Windows.Win32.System.Kernel.SLIST_HEADER").not_nil!
+    slist.union?.should be_true
+    slist.nested_type_tokens.size.should eq(slist.nested_types.size)
+    nested = api.type_by_token?(slist.nested_type_tokens.first).not_nil!
+    nested.enclosing_type_token.should eq(slist.token)
+    slist.fields.all? { |f| f.offset == 0_u32 }.should be_true
+
+    with_layout = api.types.find { |t| t.packing_size }.not_nil!
+    with_layout.value_type?.should be_true
+
+    get_process_information = apis.methods.find { |m| m.name == "GetProcessInformation" }.not_nil!
+    memory_size = get_process_information.params[2].attribute?("MemorySize").not_nil!
+    memory_size.named_arg?("BytesParamIndex").should eq("3")
+
+    float_constant = api.types.flat_map(&.fields).find { |f| f.constant_type == "float32" }.not_nil!
+    float_constant.constant_value.not_nil!.to_f32?.should_not be_nil
+
+    # Per-architecture duplicates are distinct types with their own attributes.
+    contexts = api.types.select { |t| t.full_name == "Windows.Win32.System.Diagnostics.Debug.CONTEXT" }
+    contexts.size.should be > 1
+    contexts.map { |t| t.attribute?("SupportedArchitecture").try(&.fixed_arg?(0)) }.uniq.size.should eq(contexts.size)
   end
 
   it "does not emit duplicate lines in `list types --all` output for local winmd fixture" do

@@ -1201,6 +1201,7 @@ module Ecma335
       rows = Array(CustomAttributeRow).new(row_count.to_i)
       parent_size = coded_index_size(row_counts_by_id, [TABLE_METHOD_DEF, TABLE_FIELD, TABLE_TYPE_REF, TABLE_TYPE_DEF, TABLE_PARAM, TABLE_INTERFACE_IMPL, TABLE_MEMBER_REF, TABLE_MODULE, TABLE_DECL_SECURITY, TABLE_PROPERTY, TABLE_EVENT, TABLE_STAND_ALONE_SIG, TABLE_MODULE_REF, TABLE_TYPE_SPEC, TABLE_ASSEMBLY, TABLE_ASSEMBLY_REF, TABLE_FILE, TABLE_EXPORTED_TYPE, TABLE_MANIFEST_RESOURCE, TABLE_GENERIC_PARAM, TABLE_GENERIC_PARAM_CONSTRAINT, TABLE_METHOD_SPEC], 5)
       type_size = coded_index_size(row_counts_by_id, [TABLE_METHOD_DEF, TABLE_MEMBER_REF], 3)
+      method_owners = build_method_owner_index(type_defs, method_defs.size)
       reader.seek(table_offset)
       row_count.times do
         parent = read_heap_index(reader, parent_size)
@@ -1208,9 +1209,11 @@ module Ecma335
         value = read_heap_index(reader, blob_index_size)
 
         parent_kind, parent_name = decode_custom_attribute_parent(parent, type_defs, type_refs, fields, method_defs, params, interface_impls, member_refs, module_refs)
-        type_name = decode_custom_attribute_type(attribute_type, method_defs, member_refs)
+        type_name = decode_custom_attribute_type(attribute_type, method_owners, method_defs, member_refs)
         decoded_value = decode_custom_attribute_value(blob_heap, value, type_name)
-        rows << CustomAttributeRow.new(parent, attribute_type, value, parent_kind, parent_name, type_name, decoded_value)
+        ctor_param_types = custom_attribute_ctor_param_types(attribute_type, method_defs, member_refs)
+        fixed_args, named_args = decode_custom_attribute_args(blob_heap, value, ctor_param_types)
+        rows << CustomAttributeRow.new(parent, attribute_type, value, parent_kind, parent_name, type_name, decoded_value, fixed_args, named_args)
       end
       rows
     end
@@ -1233,6 +1236,81 @@ module Ecma335
         rows << NestedClassRow.new(nested_class, enclosing_class, nested_name, enclosing_name)
       end
       rows
+    end
+
+    # Maps every MethodDef RID (1-based index into the returned array) to the
+    # qualified name of the TypeDef that owns it.
+    private def build_method_owner_index(type_defs : Array(TypeDefRow), method_count : Int32) : Array(String?)
+      owners = Array(String?).new(method_count + 1, nil)
+      type_defs.each_with_index do |type_def, idx|
+        start_rid = type_def.method_list.to_i
+        end_rid = type_defs[idx + 1]?.try(&.method_list).try(&.to_i) || (method_count + 1)
+        next if start_rid <= 0 || start_rid >= end_rid
+        name = qualify_type_name(type_def.type_namespace, type_def.type_name)
+        (start_rid...end_rid).each do |rid|
+          owners[rid] = name if rid <= method_count
+        end
+      end
+      owners
+    end
+
+    # Constructor parameter types for a CustomAttributeType coded index, in
+    # signature-decoder notation, or nil when the constructor is unknown.
+    private def custom_attribute_ctor_param_types(
+      coded_type : UInt32,
+      method_defs : Array(MethodDefRow),
+      member_refs : Array(MemberRefRow),
+    ) : Array(String)?
+      tag = coded_type & 0x7_u32
+      row_index = (coded_type >> 3).to_i
+      return nil if row_index <= 0
+
+      case tag
+      when 2_u32
+        method_defs[row_index - 1]?.try(&.decoded_signature).try(&.parameter_types)
+      when 3_u32
+        signature = member_refs[row_index - 1]?.try(&.decoded_signature)
+        signature ? split_member_ref_param_types(signature) : nil
+      else
+        nil
+      end
+    end
+
+    # "(int32, valuetype(Foo)) -> void" -> ["int32", "valuetype(Foo)"]
+    private def split_member_ref_param_types(signature : String) : Array(String)?
+      return nil unless signature.starts_with?('(')
+      close = signature.rindex(") ->")
+      return nil unless close
+      inner = signature[1...close]
+      return [] of String if inner.strip.empty?
+
+      parts = [] of String
+      depth = 0
+      current = String::Builder.new
+      inner.each_char do |char|
+        case char
+        when '(' then depth += 1
+        when ')' then depth -= 1
+        end
+        if char == ',' && depth == 0
+          parts << current.to_s.strip
+          current = String::Builder.new
+        else
+          current << char
+        end
+      end
+      parts << current.to_s.strip
+      parts
+    end
+
+    private def decode_custom_attribute_args(blob_heap : Bytes?, index : UInt32, ctor_param_types : Array(String)?) : {Array(String), Hash(String, String)}
+      empty = {Array(String).new, Hash(String, String).new}
+      return empty unless ctor_param_types
+      blob = read_blob_at(blob_heap, index)
+      return empty unless blob
+      CustomAttributeDecoder.new.decode_args(blob, ctor_param_types) || empty
+    rescue ParseError
+      {Array(String).new, Hash(String, String).new}
     end
 
     private def read_string_index(reader : BinaryReader, strings_heap : Bytes?, index_size : Int32) : String
@@ -1383,6 +1461,12 @@ module Ecma335
           (blob[5].to_u64 << 40) |
           (blob[6].to_u64 << 48) |
           (blob[7].to_u64 << 56)).to_s
+      when 0x0C_u8 # r4
+        return nil if blob.size < 4
+        IO::ByteFormat::LittleEndian.decode(Float32, blob).to_s
+      when 0x0D_u8 # r8
+        return nil if blob.size < 8
+        IO::ByteFormat::LittleEndian.decode(Float64, blob).to_s
       when 0x0E_u8 # string (UTF-16)
         decode_utf16le(blob)
       else
@@ -1705,6 +1789,7 @@ module Ecma335
 
     private def decode_custom_attribute_type(
       coded_type : UInt32,
+      method_owners : Array(String?),
       method_defs : Array(MethodDefRow),
       member_refs : Array(MemberRefRow),
     ) : String?
@@ -1714,7 +1799,7 @@ module Ecma335
 
       case tag
       when 2_u32
-        method_defs[row_index - 1]?.try(&.name)
+        method_owners[row_index]? || method_defs[row_index - 1]?.try(&.name)
       when 3_u32
         member_refs[row_index - 1]?.try(&.parent_name)
       else
@@ -1750,7 +1835,9 @@ module Ecma335
           parent_kind,
           parent_name,
           attribute.type_name,
-          attribute.decoded_value
+          attribute.decoded_value,
+          attribute.fixed_args,
+          attribute.named_args
         )
       end
     end

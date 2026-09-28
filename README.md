@@ -70,6 +70,37 @@ if api
   p method.try(&.native_import)
   p method.try(&.token)
   p method.try(&.generic_params)
+
+  # Classification comes from TypeDef flags and the base type, not from names.
+  handle = api.type?("Windows.Win32.Foundation.HANDLE")
+  if handle
+    p handle.value_type?                      # true
+    p handle.union?                           # value type with explicit layout
+    p handle.enum?, handle.delegate?, handle.interface?, handle.static_class?
+    p handle.base_type                        # "System.ValueType"
+    p handle.packing_size, handle.class_size  # from ClassLayout, or nil
+
+    # Custom attributes are available on types, fields, methods and params
+    # with their constructor and named arguments decoded.
+    p handle.has_attribute?("NativeTypedef")
+    p handle.attribute?("InvalidHandleValue").try(&.fixed_arg?(0))  # "-1"
+    p handle.fields.first.signature                                 # "nativeint"
+  end
+
+  apis = api.type?("Windows.Win32.System.Threading.Apis")
+  if apis
+    create_thread = apis.methods.find { |m| m.name == "CreateThread" }
+    p create_thread.try(&.set_last_error?)                   # from ImplMap flags
+    p create_thread.try(&.params.last.out?)                  # Param flags
+    p create_thread.try(&.params.first.attribute?("Const"))
+    p create_thread.try(&.return_attributes.map(&.name))
+    infinite = apis.fields.find { |f| f.name == "INFINITE" }
+    p infinite.try(&.constant_type), infinite.try(&.constant_value)  # "uint32", "4294967295"
+  end
+
+  # Nested types are unique only by token; enclosing/nested links carry both.
+  slist = api.type?("Windows.Win32.System.Kernel.SLIST_HEADER")
+  slist.try &.nested_type_tokens.each { |token| p api.type_by_token?(token).try(&.name) }
 end
 
 # Token-based metadata row helpers (TypeDef/MethodDef/Field)
