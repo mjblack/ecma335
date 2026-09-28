@@ -276,6 +276,33 @@ module Ecma335
       @owner_name : String? = nil,
     )
     end
+
+    # ECMA-335 II.22.9 constant element type as a signature-style type name.
+    def type_name : String?
+      case @value_type
+      when 0x02_u8 then "bool"
+      when 0x03_u8 then "char"
+      when 0x04_u8 then "int8"
+      when 0x05_u8 then "uint8"
+      when 0x06_u8 then "int16"
+      when 0x07_u8 then "uint16"
+      when 0x08_u8 then "int32"
+      when 0x09_u8 then "uint32"
+      when 0x0A_u8 then "int64"
+      when 0x0B_u8 then "uint64"
+      when 0x0C_u8 then "float32"
+      when 0x0D_u8 then "float64"
+      when 0x0E_u8 then "string"
+      when 0x12_u8 then "class"
+      else
+        nil
+      end
+    end
+
+    # RID of the owning row inside the table named by `owner_kind`.
+    def owner_rid : UInt32
+      @parent >> 2
+    end
   end
 
   struct InterfaceImplRow
@@ -598,6 +625,8 @@ module Ecma335
     getter parent_name : String?
     getter type_name : String?
     getter decoded_value : String?
+    getter fixed_args : Array(String)
+    getter named_args : Hash(String, String)
 
     def initialize(
       @parent : UInt32,
@@ -607,6 +636,8 @@ module Ecma335
       @parent_name : String? = nil,
       @type_name : String? = nil,
       @decoded_value : String? = nil,
+      @fixed_args : Array(String) = [] of String,
+      @named_args : Hash(String, String) = Hash(String, String).new,
     )
     end
   end
@@ -665,32 +696,118 @@ module Ecma335
     end
   end
 
+  # A decoded custom attribute. `fixed_args` are the constructor arguments in
+  # declaration order, `named_args` the FIELD/PROPERTY arguments by name, and
+  # `value` is the legacy single-string rendering kept for display.
+  struct ApiAttribute
+    getter type_name : String
+    getter fixed_args : Array(String)
+    getter named_args : Hash(String, String)
+    getter value : String?
+
+    def initialize(@type_name : String, @fixed_args : Array(String) = [] of String, @named_args : Hash(String, String) = Hash(String, String).new, @value : String? = nil)
+    end
+
+    # Short attribute name without namespace, e.g. "ConstAttribute".
+    def name : String
+      @type_name.split('.').last? || @type_name
+    end
+
+    # Matches the full name, the short name, or the short name without the
+    # "Attribute" suffix ("Const" matches "...Metadata.ConstAttribute").
+    def matches?(name : String) : Bool
+      short = self.name
+      name == @type_name || name == short || "#{name}Attribute" == short
+    end
+
+    def fixed_arg?(index : Int32) : String?
+      @fixed_args[index]?
+    end
+
+    def named_arg?(name : String) : String?
+      @named_args[name]?
+    end
+
+    def to_s(io : IO) : Nil
+      io << @type_name
+      if value = @value
+        io << '=' << value
+      end
+    end
+  end
+
+  module ApiAttributed
+    abstract def custom_attributes : Array(ApiAttribute)
+
+    def attribute?(name : String) : ApiAttribute?
+      custom_attributes.find { |attr| attr.matches?(name) }
+    end
+
+    def attributes(name : String) : Array(ApiAttribute)
+      custom_attributes.select { |attr| attr.matches?(name) }
+    end
+
+    def has_attribute?(name : String) : Bool
+      !attribute?(name).nil?
+    end
+  end
+
   struct ApiField
+    include ApiAttributed
+
+    FIELD_STATIC      = 0x0010_u16
+    FIELD_LITERAL     = 0x0040_u16
+    FIELD_HAS_DEFAULT = 0x8000_u16
+
     getter name : String
     getter signature : String?
     getter constant_value : String?
     getter flags : UInt16
-    getter custom_attributes : Array(String)
+    getter custom_attributes : Array(ApiAttribute)
     getter token : UInt32?
+    # Element type of `constant_value` ("uint32", "string", ...), from the Constant table.
+    getter constant_type : String?
+    # Explicit offset from FieldLayout (unions and explicit-layout structs).
+    getter offset : UInt32?
 
     def initialize(
       @name : String,
       @signature : String? = nil,
       @constant_value : String? = nil,
       @flags : UInt16 = 0_u16,
-      @custom_attributes : Array(String) = [] of String,
+      @custom_attributes : Array(ApiAttribute) = [] of ApiAttribute,
       @token : UInt32? = nil,
+      @constant_type : String? = nil,
+      @offset : UInt32? = nil,
     )
+    end
+
+    def static? : Bool
+      (@flags & FIELD_STATIC) != 0_u16
+    end
+
+    def literal? : Bool
+      (@flags & FIELD_LITERAL) != 0_u16
+    end
+
+    def has_default? : Bool
+      (@flags & FIELD_HAS_DEFAULT) != 0_u16
     end
   end
 
   struct ApiParam
+    include ApiAttributed
+
+    PARAM_IN       = 0x0001_u16
+    PARAM_OUT      = 0x0002_u16
+    PARAM_OPTIONAL = 0x0010_u16
+
     getter name : String
     getter sequence : UInt16
     getter signature_type : String?
     getter constant_value : String?
     getter flags : UInt16
-    getter custom_attributes : Array(String)
+    getter custom_attributes : Array(ApiAttribute)
     getter token : UInt32?
 
     def initialize(
@@ -699,13 +816,33 @@ module Ecma335
       @signature_type : String? = nil,
       @constant_value : String? = nil,
       @flags : UInt16 = 0_u16,
-      @custom_attributes : Array(String) = [] of String,
+      @custom_attributes : Array(ApiAttribute) = [] of ApiAttribute,
       @token : UInt32? = nil,
     )
+    end
+
+    def in? : Bool
+      (@flags & PARAM_IN) != 0_u16
+    end
+
+    def out? : Bool
+      (@flags & PARAM_OUT) != 0_u16
+    end
+
+    def optional? : Bool
+      (@flags & PARAM_OPTIONAL) != 0_u16
     end
   end
 
   struct ApiMethod
+    include ApiAttributed
+
+    METHOD_STATIC   = 0x0010_u16
+    METHOD_VIRTUAL  = 0x0040_u16
+    METHOD_ABSTRACT = 0x0400_u16
+
+    PINVOKE_SUPPORTS_LAST_ERROR = 0x0040_u16
+
     getter name : String
     getter signature : MethodSignature?
     getter params : Array(ApiParam)
@@ -715,8 +852,12 @@ module Ecma335
     getter rva : UInt32
     getter impl_flags : UInt16
     getter flags : UInt16
-    getter custom_attributes : Array(String)
+    getter custom_attributes : Array(ApiAttribute)
     getter token : UInt32?
+    # ImplMap mapping flags when the method is a P/Invoke.
+    getter pinvoke_flags : UInt16?
+    # Attributes of the return value (the Param row with sequence 0).
+    getter return_attributes : Array(ApiAttribute)
 
     def initialize(
       @name : String,
@@ -728,14 +869,46 @@ module Ecma335
       @rva : UInt32 = 0_u32,
       @impl_flags : UInt16 = 0_u16,
       @flags : UInt16 = 0_u16,
-      @custom_attributes : Array(String) = [] of String,
+      @custom_attributes : Array(ApiAttribute) = [] of ApiAttribute,
       @token : UInt32? = nil,
+      @pinvoke_flags : UInt16? = nil,
+      @return_attributes : Array(ApiAttribute) = [] of ApiAttribute,
     )
+    end
+
+    def static? : Bool
+      (@flags & METHOD_STATIC) != 0_u16
+    end
+
+    def virtual? : Bool
+      (@flags & METHOD_VIRTUAL) != 0_u16
+    end
+
+    def abstract? : Bool
+      (@flags & METHOD_ABSTRACT) != 0_u16
+    end
+
+    # True when the P/Invoke ImplMap row carries SupportsLastError.
+    def set_last_error? : Bool
+      if pinvoke = @pinvoke_flags
+        (pinvoke & PINVOKE_SUPPORTS_LAST_ERROR) != 0_u16
+      else
+        false
+      end
     end
   end
 
   struct ApiType
-    TYPE_ATTRIBUTE_INTERFACE = 0x20_u32
+    include ApiAttributed
+
+    TYPE_LAYOUT_MASK       = 0x00000018_u32
+    TYPE_SEQUENTIAL_LAYOUT = 0x00000008_u32
+    TYPE_EXPLICIT_LAYOUT   = 0x00000010_u32
+    TYPE_INTERFACE         = 0x00000020_u32
+    TYPE_ABSTRACT          = 0x00000080_u32
+    TYPE_SEALED            = 0x00000100_u32
+
+    TYPE_ATTRIBUTE_INTERFACE = TYPE_INTERFACE
 
     getter full_name : String
     getter namespace_name : String
@@ -743,16 +916,20 @@ module Ecma335
     getter fields : Array(ApiField)
     getter methods : Array(ApiMethod)
     getter interfaces : Array(String)
-    getter custom_attributes : Array(String)
+    getter custom_attributes : Array(ApiAttribute)
     getter nested_types : Array(String)
     getter enclosing_type : String?
     getter generic_params : Array(String)
     getter flags : UInt32
+    # Raw TypeDefOrRef coded index of the base type; `base_type` is its name.
     getter extends : UInt32
     getter base_type : String?
     getter class_size : UInt32?
     getter packing_size : UInt16?
     getter token : UInt32?
+    # Nested type names are not unique (`_Anonymous_e__Union`); tokens are.
+    getter nested_type_tokens : Array(UInt32)
+    getter enclosing_type_token : UInt32?
 
     def initialize(
       @full_name : String,
@@ -761,7 +938,7 @@ module Ecma335
       @fields : Array(ApiField),
       @methods : Array(ApiMethod),
       @interfaces : Array(String),
-      @custom_attributes : Array(String),
+      @custom_attributes : Array(ApiAttribute),
       @nested_types : Array(String) = [] of String,
       @enclosing_type : String? = nil,
       @generic_params : Array(String) = [] of String,
@@ -771,11 +948,60 @@ module Ecma335
       @class_size : UInt32? = nil,
       @packing_size : UInt16? = nil,
       @token : UInt32? = nil,
+      @nested_type_tokens : Array(UInt32) = [] of UInt32,
+      @enclosing_type_token : UInt32? = nil,
     )
     end
 
     def interface? : Bool
-      (@flags & TYPE_ATTRIBUTE_INTERFACE) != 0_u32
+      (@flags & TYPE_INTERFACE) != 0_u32
+    end
+
+    def abstract? : Bool
+      (@flags & TYPE_ABSTRACT) != 0_u32
+    end
+
+    def sealed? : Bool
+      (@flags & TYPE_SEALED) != 0_u32
+    end
+
+    # A C# `static class`: abstract + sealed. Win32 metadata uses this for the
+    # per-namespace `Apis` containers that hold functions and constants.
+    def static_class? : Bool
+      abstract? && sealed? && !interface?
+    end
+
+    def explicit_layout? : Bool
+      (@flags & TYPE_LAYOUT_MASK) == TYPE_EXPLICIT_LAYOUT
+    end
+
+    def sequential_layout? : Bool
+      (@flags & TYPE_LAYOUT_MASK) == TYPE_SEQUENTIAL_LAYOUT
+    end
+
+    def enum? : Bool
+      @base_type == "System.Enum"
+    end
+
+    def delegate? : Bool
+      @base_type == "System.MulticastDelegate" || @base_type == "System.Delegate"
+    end
+
+    def value_type? : Bool
+      @base_type == "System.ValueType"
+    end
+
+    def attribute_type? : Bool
+      @base_type == "System.Attribute"
+    end
+
+    # A value type with explicit layout is a C union in Win32 metadata.
+    def union? : Bool
+      value_type? && explicit_layout?
+    end
+
+    def struct? : Bool
+      value_type? && !explicit_layout?
     end
   end
 
@@ -784,15 +1010,23 @@ module Ecma335
 
     def initialize(@types : Array(ApiType))
       @by_full_name = Hash(String, ApiType).new
+      @by_token = Hash(UInt32, ApiType).new
       @by_namespace = Hash(String, Array(ApiType)).new { |hash, key| hash[key] = [] of ApiType }
       @types.each do |type|
         @by_full_name[type.full_name] = type
+        if token = type.token
+          @by_token[token] = type
+        end
         @by_namespace[type.namespace_name] << type
       end
     end
 
     def type?(full_name : String) : ApiType?
       @by_full_name[full_name]?
+    end
+
+    def type_by_token?(token : UInt32) : ApiType?
+      @by_token[token]?
     end
 
     def types_in_namespace(namespace_name : String) : Array(ApiType)

@@ -521,7 +521,7 @@ module Ecma335
           end
           json.field "custom_attributes" do
             json.array do
-              type.custom_attributes.each { |value| json.string value }
+              type.custom_attributes.each { |value| json.string value.to_s }
             end
           end
           json.field "fields" do

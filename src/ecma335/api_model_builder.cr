@@ -1,4 +1,9 @@
 module Ecma335
+  # Projects the raw metadata tables into the normalized `ApiModel`.
+  #
+  # Every cross-table lookup here is keyed by metadata token taken from the
+  # coded index stored in the referencing row, never by name: Win32 metadata
+  # contains thousands of constants, params and nested types that share a name.
   class ApiModelBuilder
     TYPE_DEF_TOKEN_PREFIX   = 0x02000000_u32
     FIELD_TOKEN_PREFIX      = 0x04000000_u32
@@ -8,18 +13,17 @@ module Ecma335
     def build(tables : TablesStream?) : ApiModel?
       return nil unless tables
 
-      field_constants = Hash(UInt32, String).new
-      param_constants = Hash(UInt32, String).new
+      field_constants = Hash(UInt32, ConstantRow).new
+      param_constants = Hash(UInt32, ConstantRow).new
       tables.constants.each do |constant|
-        value = constant.decoded_value
-        next unless value
+        next unless constant.decoded_value
         owner_token = decode_has_constant_owner_token(constant.parent)
         next unless owner_token
         token_prefix = owner_token & 0xFF00_0000_u32
         if token_prefix == FIELD_TOKEN_PREFIX
-          field_constants[owner_token] = value
+          field_constants[owner_token] = constant
         elsif token_prefix == PARAM_TOKEN_PREFIX
-          param_constants[owner_token] = value
+          param_constants[owner_token] = constant
         end
       end
 
@@ -41,28 +45,24 @@ module Ecma335
         interfaces_by_type[class_token] << interface_name
       end
 
-      attrs_by_type = Hash(UInt32, Array(String)).new { |h, k| h[k] = [] of String }
-      attrs_by_field = Hash(UInt32, Array(String)).new { |h, k| h[k] = [] of String }
-      attrs_by_method = Hash(UInt32, Array(String)).new { |h, k| h[k] = [] of String }
-      attrs_by_param = Hash(UInt32, Array(String)).new { |h, k| h[k] = [] of String }
+      attrs_by_type = Hash(UInt32, Array(ApiAttribute)).new { |h, k| h[k] = [] of ApiAttribute }
+      attrs_by_field = Hash(UInt32, Array(ApiAttribute)).new { |h, k| h[k] = [] of ApiAttribute }
+      attrs_by_method = Hash(UInt32, Array(ApiAttribute)).new { |h, k| h[k] = [] of ApiAttribute }
+      attrs_by_param = Hash(UInt32, Array(ApiAttribute)).new { |h, k| h[k] = [] of ApiAttribute }
       tables.custom_attributes.each do |attr|
         parent_token = decode_custom_attribute_parent_token(attr.parent)
         next unless parent_token
-        display = if value = attr.decoded_value
-                    "#{attr.type_name || "attribute"}=#{value}"
-                  else
-                    attr.type_name || "attribute"
-                  end
+        api_attr = ApiAttribute.new(attr.type_name || "attribute", attr.fixed_args, attr.named_args, attr.decoded_value)
         token_prefix = parent_token & 0xFF00_0000_u32
         case token_prefix
         when TYPE_DEF_TOKEN_PREFIX
-          attrs_by_type[parent_token] << display
+          attrs_by_type[parent_token] << api_attr
         when FIELD_TOKEN_PREFIX
-          attrs_by_field[parent_token] << display
+          attrs_by_field[parent_token] << api_attr
         when METHOD_DEF_TOKEN_PREFIX
-          attrs_by_method[parent_token] << display
+          attrs_by_method[parent_token] << api_attr
         when PARAM_TOKEN_PREFIX
-          attrs_by_param[parent_token] << display
+          attrs_by_param[parent_token] << api_attr
         end
       end
 
@@ -81,7 +81,8 @@ module Ecma335
       end
 
       nested_types_by_parent = Hash(UInt32, Array(String)).new { |h, k| h[k] = [] of String }
-      enclosing_type_by_nested = Hash(UInt32, String).new
+      nested_tokens_by_parent = Hash(UInt32, Array(UInt32)).new { |h, k| h[k] = [] of UInt32 }
+      enclosing_by_nested = Hash(UInt32, {String, UInt32}).new
       tables.nested_classes.each do |nested|
         child = nested.nested_name
         parent_name = nested.enclosing_name
@@ -90,7 +91,8 @@ module Ecma335
         parent_token = make_token(TYPE_DEF_TOKEN_PREFIX, nested.enclosing_class.to_i)
         child_token = make_token(TYPE_DEF_TOKEN_PREFIX, nested.nested_class.to_i)
         nested_types_by_parent[parent_token] << child
-        enclosing_type_by_nested[child_token] = parent_name
+        nested_tokens_by_parent[parent_token] << child_token
+        enclosing_by_nested[child_token] = {parent_name, parent_token}
       end
 
       class_layout_by_type = Hash(UInt32, ClassLayoutRow).new
@@ -98,6 +100,12 @@ module Ecma335
         next if layout.parent == 0_u32
         type_token = make_token(TYPE_DEF_TOKEN_PREFIX, layout.parent.to_i)
         class_layout_by_type[type_token] = layout
+      end
+
+      offset_by_field = Hash(UInt32, UInt32).new
+      tables.field_layouts.each do |layout|
+        next if layout.field == 0_u32
+        offset_by_field[make_token(FIELD_TOKEN_PREFIX, layout.field.to_i)] = layout.offset
       end
 
       api_types = [] of ApiType
@@ -114,13 +122,16 @@ module Ecma335
             row = tables.fields[rid - 1]?
             next unless row
             field_token = make_token(FIELD_TOKEN_PREFIX, rid)
+            constant = field_constants[field_token]?
             fields << ApiField.new(
               row.name,
               row.decoded_signature,
-              field_constants[field_token]?,
+              constant.try(&.decoded_value),
               row.flags,
-              attrs_by_field[field_token]? || [] of String,
-              field_token
+              attrs_by_field[field_token]? || [] of ApiAttribute,
+              field_token,
+              constant.try(&.type_name),
+              offset_by_field[field_token]?
             )
           end
         end
@@ -133,20 +144,24 @@ module Ecma335
             next unless method
             next_param_rid = tables.method_defs[rid]?.try(&.param_list).try(&.to_i) || (tables.params.size + 1)
             params = [] of ApiParam
+            return_attrs = [] of ApiAttribute
             start_param = method.param_list.to_i
             if start_param > 0 && start_param < next_param_rid
               (start_param...(next_param_rid)).each do |prid|
                 param = tables.params[prid - 1]?
                 next unless param
-                next if param.sequence == 0_u16
                 param_token = make_token(PARAM_TOKEN_PREFIX, prid)
+                if param.sequence == 0_u16
+                  return_attrs = attrs_by_param[param_token]? || [] of ApiAttribute
+                  next
+                end
                 params << ApiParam.new(
                   param.name,
                   param.sequence,
                   param.signature_type,
-                  param_constants[param_token]?,
+                  param_constants[param_token]?.try(&.decoded_value),
                   param.flags,
-                  attrs_by_param[param_token]? || [] of String,
+                  attrs_by_param[param_token]? || [] of ApiAttribute,
                   param_token
                 )
               end
@@ -167,13 +182,16 @@ module Ecma335
               method.rva,
               method.impl_flags,
               method.flags,
-              attrs_by_method[method_token]? || [] of String,
-              method_token
+              attrs_by_method[method_token]? || [] of ApiAttribute,
+              method_token,
+              impl.try(&.mapping_flags),
+              return_attrs
             )
           end
         end
 
         layout = class_layout_by_type[type_token]?
+        enclosing = enclosing_by_nested[type_token]?
 
         api_types << ApiType.new(
           full_name,
@@ -182,16 +200,18 @@ module Ecma335
           fields,
           methods,
           interfaces_by_type[type_token]? || [] of String,
-          attrs_by_type[type_token]? || [] of String,
+          attrs_by_type[type_token]? || [] of ApiAttribute,
           nested_types_by_parent[type_token]? || [] of String,
-          enclosing_type_by_nested[type_token]?,
+          enclosing.try(&.[0]),
           type_generic_params[type_token]? || [] of String,
           type_def.flags,
           type_def.extends,
           resolve_type_def_or_ref(type_def.extends, tables),
           layout.try(&.class_size),
           layout.try(&.packing_size),
-          type_token
+          type_token,
+          nested_tokens_by_parent[type_token]? || [] of UInt32,
+          enclosing.try(&.[1])
         )
       end
 
